@@ -10,12 +10,11 @@ class Player(BaseBot):
         self.hands_played = 0
         
         # 1. Pre-Compile C-Level Ranges for Zero Latency
-        # Tight: Top ~15% of hands
         self.range_tight = eval7.HandRange("77+,A8s+,K9s+,QTs+,JTs+,ATo+,KJo+,QJo")
-        # Medium: Top ~40% of hands
         self.range_medium = eval7.HandRange("44+,A2s+,K5s+,Q8s+,J8s+,T8s+,98s+,87s+,A7o+,K9o+,QTo+,JTo")
-        # Wide: 100% Random
-        self.range_wide = eval7.HandRange("XX")
+        
+        # FIX: Explicit 100% PokerStove syntax to prevent eval7 from crashing
+        self.range_wide = eval7.HandRange("22+,A2s+,K2s+,Q2s+,J2s+,T2s+,92s+,82s+,72s+,62s+,52s+,42s+,32s+,A2o+,K2o+,Q2o+,J2o+,T2o+,92o+,82o+,72o+,62o+,52o+,42o+,32o+")
         
         # 2. Learning Mechanism (Opponent Baseline Aggression)
         self.avg_pot_size = 40.0 
@@ -54,7 +53,6 @@ class Player(BaseBot):
         # 1. AUCTION STREET (The Vickrey Tax)
         # ---------------------------------------------------------
         if current_state.street == 'auction':
-            # Forces opponents like Full_House and Alpha44 to bleed chips
             if self.preflop_score >= 8: bid_amt = 251 
             elif self.preflop_score >= 5: bid_amt = 248  
             else: bid_amt = 15   
