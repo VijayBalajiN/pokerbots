@@ -12,8 +12,7 @@ class Player(BaseBot):
         # 1. Pre-Compile C-Level Ranges for Zero Latency
         self.range_tight = eval7.HandRange("77+,A8s+,K9s+,QTs+,JTs+,ATo+,KJo+,QJo")
         self.range_medium = eval7.HandRange("44+,A2s+,K5s+,Q8s+,J8s+,T8s+,98s+,87s+,A7o+,K9o+,QTo+,JTo")
-        
-        # FIX: Explicit 100% PokerStove syntax to prevent eval7 from crashing
+        # Explicit 100% PokerStove syntax to prevent eval7 from crashing on "XX"
         self.range_wide = eval7.HandRange("22+,A2s+,K2s+,Q2s+,J2s+,T2s+,92s+,82s+,72s+,62s+,52s+,42s+,32s+,A2o+,K2o+,Q2o+,J2o+,T2o+,92o+,82o+,72o+,62o+,52o+,42o+,32o+")
         
         # 2. Learning Mechanism (Opponent Baseline Aggression)
@@ -56,35 +55,41 @@ class Player(BaseBot):
             if self.preflop_score >= 8: bid_amt = 251 
             elif self.preflop_score >= 5: bid_amt = 248  
             else: bid_amt = 15   
-            return ActionBid(min(bid_amt, current_state.my_chips))
+            return ActionBid(int(min(bid_amt, current_state.my_chips)))
 
         # ---------------------------------------------------------
-        # 2. PRE-FLOP LOGIC (Raise-Capped)
+        # 2. PRE-FLOP LOGIC (Raise-Capped & Fallback Protected)
         # ---------------------------------------------------------
         if current_state.street == 'pre-flop':
             if current_state.cost_to_call > 0:
                 if current_state.cost_to_call <= 20: 
-                    if self.preflop_score >= 9 and current_state.can_act(ActionRaise):
-                        min_r, max_r = current_state.raise_bounds
-                        return ActionRaise(max(min_r, min(max_r, min_r + 40)))
-                    elif self.preflop_score >= 4 and current_state.can_act(ActionCall):
-                        return ActionCall()
+                    # Small Blind / Min Raise completion
+                    if self.preflop_score >= 9:
+                        if current_state.can_act(ActionRaise):
+                            min_r, max_r = current_state.raise_bounds
+                            return ActionRaise(int(max(min_r, min(max_r, min_r + 40))))
+                        return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
+                    elif self.preflop_score >= 4:
+                        return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
                 else:
+                    # Facing a heavy raise
                     if self.preflop_score >= 10:
-                        # Pre-Flop Shove Fix: Never bloat massive pots without QQ, KK, AA (Score >= 14)
+                        # Pre-Flop Shove Cap: Never bloat massive pots without QQ, KK, AA
                         if current_state.pot > 400 or self.preflop_score < 14:
                             return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
                             
                         if current_state.can_act(ActionRaise):
                             min_r, max_r = current_state.raise_bounds
-                            return ActionRaise(max(min_r, min(max_r, min_r + int(current_state.pot * 0.5))))
+                            return ActionRaise(int(max(min_r, min(max_r, min_r + current_state.pot * 0.5))))
+                        return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
+                        
                     elif self.preflop_score >= 7 and current_state.cost_to_call < 200:
                         return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
                         
                 return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
             else:
                 if self.preflop_score >= 9 and current_state.can_act(ActionRaise):
-                    return ActionRaise(current_state.raise_bounds[0])
+                    return ActionRaise(int(current_state.raise_bounds[0]))
                 return ActionCheck() if current_state.can_act(ActionCheck) else ActionCall()
 
         # ---------------------------------------------------------
@@ -104,13 +109,12 @@ class Player(BaseBot):
         else:
             assumed_range = self.range_wide
         
-        # 200 iter pure-C Monte Carlo resolves board texture traps and equity scaling natively.
-        equity = eval7.py_hand_vs_range_monte_carlo(
-            my_cards, 
-            assumed_range, 
-            board_cards, 
-            200
-        )
+        # eval7 Blocker Crash Protection
+        try:
+            equity = eval7.py_hand_vs_range_monte_carlo(my_cards, assumed_range, board_cards, 200)
+        except Exception:
+            # If the range is mathematically empty because we hold the exact cards they need
+            equity = 1.0
 
         # Threat Assessment from Auction Peek
         threat_level = 0.0
@@ -132,19 +136,21 @@ class Player(BaseBot):
             
             if equity > required_equity:
                 # Infinite Raise Loop Fix: Only re-raise if we are a crushing absolute favorite.
-                if current_state.can_act(ActionRaise) and equity > max(0.65, required_equity + 0.20):
-                    min_r, max_r = current_state.raise_bounds
-                    target_bet = max(min_r, min(max_r, min_r + int(pot_size * 0.75)))
-                    return ActionRaise(target_bet)
-                return ActionCall()
+                if equity > max(0.65, required_equity + 0.20):
+                    if current_state.can_act(ActionRaise):
+                        min_r, max_r = current_state.raise_bounds
+                        target_bet = max(min_r, min(max_r, min_r + int(pot_size * 0.75)))
+                        return ActionRaise(int(target_bet))
+                return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
                 
             return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
             
         else:
-            if equity > (0.55 + threat_level) and current_state.can_act(ActionRaise):
-                min_r, max_r = current_state.raise_bounds
-                target_bet = max(min_r, min(max_r, min_r + int(pot_size * 0.50)))
-                return ActionRaise(target_bet)
+            if equity > (0.55 + threat_level):
+                if current_state.can_act(ActionRaise):
+                    min_r, max_r = current_state.raise_bounds
+                    target_bet = max(min_r, min(max_r, min_r + int(pot_size * 0.50)))
+                    return ActionRaise(int(target_bet))
             return ActionCheck() if current_state.can_act(ActionCheck) else ActionCall()
 
 if __name__ == '__main__':
