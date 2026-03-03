@@ -35,9 +35,10 @@ class Player(BaseBot):
         self.opp_bid_M2   = 2500.0   # variance numerator; std = sqrt(M2 / n)
 
         # Per-hand auction state machine
-        self.my_initial_chips  = STARTING_STACK  # chips at hand start (post-blind)
-        self.my_auction_bid    = 0               # what we bid this auction
-        self.auction_resolved  = False           # True once we've processed the result
+        self.my_initial_chips       = STARTING_STACK  # chips at hand start (post-blind)
+        self.my_chips_before_auction = STARTING_STACK  # exact snapshot taken when we bid
+        self.my_auction_bid         = 0               # what we bid this auction
+        self.auction_resolved       = False           # True once we've processed the result
 
         # ── Pre-allocated deck ────────────────────────────────────────────────────
         all_ranks = '23456789TJQKA'
@@ -111,7 +112,9 @@ class Player(BaseBot):
             return
         self.auction_resolved = True
 
-        chip_delta = self.my_initial_chips - current_state.my_chips
+        # Use the chip snapshot taken at auction time, not hand-start chips,
+        # to exclude pre-flop betting from the delta calculation.
+        chip_delta = self.my_chips_before_auction - current_state.my_chips
         we_won = bool(current_state.opp_revealed_cards)
 
         if we_won and chip_delta > 0:
@@ -133,9 +136,10 @@ class Player(BaseBot):
     def on_hand_start(self, game_info: GameInfo, current_state: PokerState) -> None:
         self.hands_played += 1
         self.preflop_score   = self._get_chen_score(current_state.my_hand)
-        self.my_initial_chips = current_state.my_chips  # chips AFTER posting blind
-        self.my_auction_bid   = 0
-        self.auction_resolved = False
+        self.my_initial_chips        = current_state.my_chips  # chips AFTER posting blind
+        self.my_chips_before_auction  = current_state.my_chips
+        self.my_auction_bid           = 0
+        self.auction_resolved         = False
         self.current_hand_history = {}
 
     def on_hand_end(self, game_info: GameInfo, current_state: PokerState) -> None:
@@ -233,7 +237,8 @@ class Player(BaseBot):
                 bid_amt = max(0, int(opp_pred_min) - 1)
 
             # Record for later chip-delta inference
-            self.my_auction_bid = int(min(bid_amt, current_state.my_chips))
+            self.my_auction_bid          = int(min(bid_amt, current_state.my_chips))
+            self.my_chips_before_auction = current_state.my_chips  # EXACT snapshot before paying
             return ActionBid(self.my_auction_bid)
 
         # =========================================================================
@@ -377,7 +382,13 @@ class Player(BaseBot):
                 return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
             return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
         else:
-            if equity > (0.55 + threat_level):
+            # ML-Driven C-Betting: if the model has learned the opponent plays a wide,
+            # trashy range (high predicted_percentile), lower our betting threshold
+            # so we bluff them off the pot even when we miss the flop.
+            # Against a tight opponent (low percentile) keep the conservative 0.55 bar.
+            bet_threshold = 0.40 if predicted_percentile > 0.60 else 0.55
+
+            if equity > (bet_threshold + threat_level):
                 if can_raise_safely and current_state.can_act(ActionRaise):
                     min_r, max_r = current_state.raise_bounds
                     target_bet   = max(min_r, min(max_r, min_r + int(current_state.pot * 0.50)))
