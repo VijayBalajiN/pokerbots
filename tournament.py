@@ -51,13 +51,18 @@ def discover_bots(bots_dir: Path) -> list[tuple[str, str]]:
 
 def write_temp_config(bot1_name, bot1_file, bot2_name, bot2_file, log_folder):
     """Write a temporary config.py that the engine will import."""
+    # Use forward slashes to avoid unescaped backslash syntax errors on Windows
+    py_cmd    = sys.executable.replace('\\', '/')
+    b1_file   = bot1_file.replace('\\', '/')
+    b2_file   = bot2_file.replace('\\', '/')
+    log_dir   = log_folder.replace('\\', '/') if isinstance(log_folder, str) else str(log_folder).replace('\\', '/')
     content = textwrap.dedent(f"""\
-        PYTHON_CMD = "{sys.executable}"
+        PYTHON_CMD = "{py_cmd}"
         BOT_1_NAME = '{bot1_name}'
-        BOT_1_FILE = '{bot1_file}'
+        BOT_1_FILE = '{b1_file}'
         BOT_2_NAME = '{bot2_name}'
-        BOT_2_FILE = '{bot2_file}'
-        GAME_LOG_FOLDER = '{log_folder}'
+        BOT_2_FILE = '{b2_file}'
+        GAME_LOG_FOLDER = '{log_dir}'
     """)
     CONFIG_PATH.write_text(content)
 
