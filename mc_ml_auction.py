@@ -11,13 +11,15 @@ class Player(BaseBot):
     def __init__(self) -> None:
         self.hands_played = 0
         
-        # 1. Scaled ML Parameters
-        self.theta = {'pre-flop': 0.0, 'flop': 0.0, 'turn': 0.0, 'river': 0.0}
-        self.b = {'pre-flop': 0.0, 'flop': 0.0, 'turn': 0.0, 'river': 0.0}
+        # 1. Scaled ML Parameters (Intelligent Bayesian Priors)
+        # Initializes expecting massive bets to mean tight ranges
+        self.theta = {'pre-flop': -1.0, 'flop': -1.0, 'turn': -1.0, 'river': -1.0}
+        self.b = {'pre-flop': 1.5, 'flop': 1.5, 'turn': 1.5, 'river': 1.5}
         self.learning_rate = 0.01
         
         self.current_hand_history = {}
-
+        self.training_samples = 0 # Tracks actual learning events (opp revealed cards)
+        
         # 2. Latency Optimization: Pre-allocate deck & combinations
         all_ranks = '23456789TJQKA'
         all_suits = 'cdhs'
@@ -62,6 +64,8 @@ class Player(BaseBot):
         opp_cards = current_state.opp_revealed_cards
         if not opp_cards:
             return 
+            
+        self.training_samples += 1 # We actually saw cards and learned!
             
         for street, state_data in self.current_hand_history.items():
             if street == 'pre-flop':
@@ -140,14 +144,14 @@ class Player(BaseBot):
         # ---------------------------------------------------------
         if current_state.street == 'pre-flop':
             if current_state.cost_to_call > 0:
-                # If they bet cheap (<50 chips), we can call with marginal hands (Score >= 5)
-                if current_state.cost_to_call <= 50: 
+                # Tightened to 20: Only complete small blinds/limps with marginal hands
+                if current_state.cost_to_call <= 20: 
                     if self.preflop_score >= 9 and current_state.can_act(ActionRaise):
                         return ActionRaise(int(max(current_state.raise_bounds[0], min(current_state.raise_bounds[1], current_state.raise_bounds[0] + 40))))
                     elif self.preflop_score >= 5:
                         return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
                 else:
-                    # If they bet heavy (>50 chips), STRICTLY require a premium hand (Score >= 10)
+                    # If they raise to > 20 chips, STRICTLY require a premium hand (Score >= 10)
                     if self.preflop_score >= 10:
                         if current_state.pot > 400 or self.preflop_score < 14:
                             return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
@@ -155,7 +159,7 @@ class Player(BaseBot):
                             return ActionRaise(int(max(current_state.raise_bounds[0], min(current_state.raise_bounds[1], current_state.raise_bounds[0] + current_state.pot * 0.5))))
                         return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
                         
-                # Completely eliminates the 120-chip bleed from UDF1
+                # Completely eliminates the 60-chip and 120-chip bleed from prior logs
                 return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
             else:
                 if self.preflop_score >= 9 and current_state.can_act(ActionRaise):
@@ -220,9 +224,8 @@ class Player(BaseBot):
             can_raise_safely = False
 
         # THE EXPLOITATION OVERRIDE (Dynamic Stop-Loss)
-        # If the ML model has calibrated (>50 hands) and predicts an absolute crush (>85% equity),
-        # we drop the training wheels and allow raising huge pots with Trips, Two Pair, or Straights.
-        if self.hands_played > 50 and equity > 0.85:
+        # Only drop the shields if we have actually extracted ground-truth data from >= 10 hands
+        if self.training_samples >= 10 and equity > 0.85:
             if hand_type in ["Straight", "Three of a Kind", "Two Pair"]:
                 can_raise_safely = True
 
