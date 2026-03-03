@@ -156,6 +156,8 @@ def main():
                         help='Directory containing bot .py files (default: ./bots)')
     parser.add_argument('--output', type=str, default='tournament_results.csv',
                         help='CSV output file (default: tournament_results.csv)')
+    parser.add_argument('--summary-output', type=str, default='bot_summary.csv',
+                        help='Per-bot summary CSV (default: bot_summary.csv)')
     args = parser.parse_args()
 
     bots_dir = Path(args.bots_dir).resolve()
@@ -296,29 +298,91 @@ def main():
             print(f"│    Match {m}: {r['bot1_bankroll']:>+7d} / {r['bot2_bankroll']:>+7d}  → {w}")
         print(f"└{'─'*69}")
 
+    # ─── Aggregate per-bot stats ──────────────────────────────────────────
+    bot_stats = {}  # name -> accumulated stats dict
+    for (b1_name, b2_name), results in aggregated.items():
+        for name in [b1_name, b2_name]:
+            if name not in bot_stats:
+                bot_stats[name] = {
+                    'wins': 0, 'losses': 0, 'ties': 0,
+                    'total_bankroll': 0, 'matches': 0,
+                    'total_win_rate': 0.0,
+                    'total_avg_payoff': 0.0,
+                    'total_auction_wr': 0.0,
+                    'total_avg_bid': 0.0,
+                    'total_bid_var': 0.0,
+                    'total_avg_query_time': 0.0,
+                    'total_max_time': 0.0,
+                }
+        for r in results:
+            # bot1 side
+            bot_stats[b1_name]['matches'] += 1
+            bot_stats[b1_name]['total_bankroll'] += r['bot1_bankroll']
+            bot_stats[b1_name]['total_win_rate'] += r['bot1_win_rate']
+            bot_stats[b1_name]['total_avg_payoff'] += r['bot1_avg_payoff']
+            bot_stats[b1_name]['total_auction_wr'] += r['bot1_auction_wr']
+            bot_stats[b1_name]['total_avg_bid'] += r['bot1_avg_bid']
+            bot_stats[b1_name]['total_avg_query_time'] += r['bot1_avg_query_time']
+            bot_stats[b1_name]['total_max_time'] = max(bot_stats[b1_name]['total_max_time'], r['bot1_max_time'])
+            # bot2 side
+            bot_stats[b2_name]['matches'] += 1
+            bot_stats[b2_name]['total_bankroll'] += r['bot2_bankroll']
+            bot_stats[b2_name]['total_win_rate'] += r['bot2_win_rate']
+            bot_stats[b2_name]['total_avg_payoff'] += r['bot2_avg_payoff']
+            bot_stats[b2_name]['total_auction_wr'] += r['bot2_auction_wr']
+            bot_stats[b2_name]['total_avg_bid'] += r['bot2_avg_bid']
+            bot_stats[b2_name]['total_avg_query_time'] += r['bot2_avg_query_time']
+            bot_stats[b2_name]['total_max_time'] = max(bot_stats[b2_name]['total_max_time'], r['bot2_max_time'])
+            # W/L/T
+            if r['winner'] == b1_name:
+                bot_stats[b1_name]['wins'] += 1
+                bot_stats[b2_name]['losses'] += 1
+            elif r['winner'] == b2_name:
+                bot_stats[b2_name]['wins'] += 1
+                bot_stats[b1_name]['losses'] += 1
+            else:
+                bot_stats[b1_name]['ties'] += 1
+                bot_stats[b2_name]['ties'] += 1
+
+    # ─── Write per-bot summary CSV ──────────────────────────────────────────
+    if bot_stats:
+        summary_csv_path = SCRIPT_DIR / args.summary_output
+        summary_fields = [
+            'bot', 'matches', 'wins', 'losses', 'ties', 'win_pct',
+            'total_bankroll', 'avg_bankroll',
+            'avg_win_rate', 'avg_payoff_per_hand',
+            'avg_auction_win_rate', 'avg_bid',
+            'avg_query_time', 'max_response_time',
+        ]
+        # Sort by total bankroll descending
+        sorted_bots = sorted(bot_stats.items(), key=lambda x: x[1]['total_bankroll'], reverse=True)
+        summary_rows = []
+        for name, s in sorted_bots:
+            n = s['matches'] or 1
+            summary_rows.append({
+                'bot': name,
+                'matches': s['matches'],
+                'wins': s['wins'],
+                'losses': s['losses'],
+                'ties': s['ties'],
+                'win_pct': round(s['wins'] / n * 100, 1),
+                'total_bankroll': s['total_bankroll'],
+                'avg_bankroll': round(s['total_bankroll'] / n, 1),
+                'avg_win_rate': round(s['total_win_rate'] / n, 1),
+                'avg_payoff_per_hand': round(s['total_avg_payoff'] / n, 2),
+                'avg_auction_win_rate': round(s['total_auction_wr'] / n, 1),
+                'avg_bid': round(s['total_avg_bid'] / n, 2),
+                'avg_query_time': round(s['total_avg_query_time'] / n, 5),
+                'max_response_time': round(s['total_max_time'], 5),
+            })
+        with open(summary_csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=summary_fields)
+            writer.writeheader()
+            writer.writerows(summary_rows)
+        print(f"✓ Bot summary saved to {summary_csv_path}")
+
     # ─── Leaderboard ────────────────────────────────────────────────────────
     if len(aggregated) > 1 or args.mode == 'one':
-        # Aggregate per-bot stats
-        bot_stats = {}  # name -> { 'wins', 'losses', 'ties', 'total_bankroll', 'matches' }
-        for (b1_name, b2_name), results in aggregated.items():
-            for name in [b1_name, b2_name]:
-                if name not in bot_stats:
-                    bot_stats[name] = {'wins': 0, 'losses': 0, 'ties': 0, 'total_bankroll': 0, 'matches': 0}
-            for r in results:
-                bot_stats[b1_name]['matches'] += 1
-                bot_stats[b2_name]['matches'] += 1
-                bot_stats[b1_name]['total_bankroll'] += r['bot1_bankroll']
-                bot_stats[b2_name]['total_bankroll'] += r['bot2_bankroll']
-                if r['winner'] == b1_name:
-                    bot_stats[b1_name]['wins'] += 1
-                    bot_stats[b2_name]['losses'] += 1
-                elif r['winner'] == b2_name:
-                    bot_stats[b2_name]['wins'] += 1
-                    bot_stats[b1_name]['losses'] += 1
-                else:
-                    bot_stats[b1_name]['ties'] += 1
-                    bot_stats[b2_name]['ties'] += 1
-
         # Sort by total bankroll
         leaderboard = sorted(bot_stats.items(), key=lambda x: x[1]['total_bankroll'], reverse=True)
 
