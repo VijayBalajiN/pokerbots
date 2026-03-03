@@ -12,3 +12,6 @@ venv/
 logs/
 *.glog
 *.plog
+
+bot_summary.csv
+tournament_results.csv
