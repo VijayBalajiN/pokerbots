@@ -22,10 +22,13 @@ class Player(BaseBot):
         self.training_samples = 0  # counts only full 2-card reveals
 
         # ── Welford Online Normalization (learned input scaling, per street) ─────
-        streets = ['pre-flop', 'flop', 'turn', 'river']
-        self.scale_n    = {s: 1    for s in streets}
-        self.scale_mean = {'pre-flop':  50.0, 'flop': 200.0, 'turn': 350.0, 'river': 500.0}
-        self.scale_M2   = {'pre-flop': 2500.0, 'flop': 40000.0, 'turn': 122500.0, 'river': 250000.0}
+        # REMOVED: Welford running-mean normalization is fragile against the Pareto
+        # distribution of poker pot sizes (rare all-in shoves skew the mean, causing
+        # normal pots to yield negative x_scaled and flip the model's predictions).
+        # REPLACED WITH: log1p normalization — deterministic, outlier-immune, monotonic.
+        # log1p(pot) / LOG_SCALE maps [0, 5000] → [0, ~2.8], preserving gradient signal
+        # with the existing theta/b priors without any running state.
+        self._LOG_SCALE = math.log1p(5000.0)  # ≈ 8.52; normalises pots to ~[0, 1]
 
         # ── Adaptive Auction: Opponent Bid Model (Welford) ───────────────────────
         # Tracks the distribution of the opponent's historical bids.
@@ -35,10 +38,13 @@ class Player(BaseBot):
         self.opp_bid_M2   = 2500.0   # variance numerator; std = sqrt(M2 / n)
 
         # Per-hand auction state machine
-        self.my_initial_chips       = STARTING_STACK  # chips at hand start (post-blind)
+        self.my_initial_chips        = STARTING_STACK  # chips at hand start (post-blind)
         self.my_chips_before_auction = STARTING_STACK  # exact snapshot taken when we bid
-        self.my_auction_bid         = 0               # what we bid this auction
-        self.auction_resolved       = False           # True once we've processed the result
+        self.my_auction_bid          = 0               # what we bid this auction
+        self.auction_resolved        = False           # True once we've processed the result
+        # 'win'  = we actively tried to win (strong hand)
+        # 'lose' = we deliberately bid below floor (weak/marginal hand)
+        self.auction_intent          = 'lose'
 
         # ── Pre-allocated deck ────────────────────────────────────────────────────
         all_ranks = '23456789TJQKA'
@@ -121,11 +127,20 @@ class Player(BaseBot):
             # Exact observation: opponent bid exactly chip_delta
             self._update_opp_bid_model(chip_delta)
         else:
-            # We lost (or tied with 0-0): opponent bid ≥ our bid.
-            # Soft update: assume their bid is our bid + half a std above the current mean
-            # (conservative upward nudge; prevents the mean from being dragged low by losses).
+            # We lost. How we estimate their bid depends on whether we *tried* to win.
+            # If auction_intent == 'win': our bid was genuine → they beat it, so they
+            #   bid somewhere above ours. Anchor on our bid + upward nudge.
+            # If auction_intent == 'lose': our bid was deliberately near-zero and tells
+            #   us nothing about their actual bid. Anchoring on it would cause a
+            #   self-reinforcing downward spiral. Instead anchor on the current model
+            #   mean, which is already our best estimate of their typical bid.
             opp_bid_std = self._welford_std(self.opp_bid_n, self.opp_bid_M2)
-            soft_estimate = self.my_auction_bid + max(5.0, opp_bid_std * 0.5)
+            if self.auction_intent == 'win':
+                # Genuine contest: they outbid us, so they're somewhere above our bid
+                soft_estimate = self.my_auction_bid + max(5.0, opp_bid_std * 0.5)
+            else:
+                # Intentional fold: use model mean as anchor (not our useless 0-bid)
+                soft_estimate = self.opp_bid_mean + max(5.0, opp_bid_std * 0.25)
             soft_estimate = min(soft_estimate, 500.0)  # cap at reasonable maximum
             self._update_opp_bid_model(soft_estimate)
 
@@ -140,6 +155,7 @@ class Player(BaseBot):
         self.my_chips_before_auction  = current_state.my_chips
         self.my_auction_bid           = 0
         self.auction_resolved         = False
+        self.auction_intent           = 'lose'
         self.current_hand_history = {}
 
     def on_hand_end(self, game_info: GameInfo, current_state: PokerState) -> None:
@@ -209,32 +225,26 @@ class Player(BaseBot):
 
             if self.preflop_score >= 10:
                 # ── WANT TO WIN: barely outbid predicted max ─────────────────────
-                # We have a strong hand; winning the auction gives us a card peek
-                # that's worth paying for. We bid just above their likely ceiling
-                # so we win but pay minimally (we pay THEIR bid, not ours).
-                # Small random jitter prevents us from being read exactly.
                 target = opp_pred_max + 1 + random.randint(0, 5)
                 bid_amt = int(min(target, current_state.my_chips))
+                self.auction_intent = 'win'
 
             elif self.preflop_score >= 6:
                 # ── MARGINAL HAND: decide based on information value ──────────────
-                # If opp is predicted to bid low (< 30), occasionally contest
-                # cheaply (bid floor+1) — the peek is worth a small premium.
-                # Otherwise stay below their floor to deny them cheap info.
                 if opp_pred_max < 30 and random.random() < 0.40:
                     # Cheap contest: barely outbid their expected floor
                     target = opp_pred_min + 1 + random.randint(0, 3)
                     bid_amt = int(min(target, current_state.my_chips))
+                    self.auction_intent = 'win'
                 else:
                     # Bow out: bid below their floor so they win but pay their own high bid
                     bid_amt = max(0, int(opp_pred_min) - 1)
+                    self.auction_intent = 'lose'
 
             else:
                 # ── DON'T WANT TO WIN: bid below predicted floor ─────────────────
-                # Weak hand — information is not worth buying.
-                # Bid below their floor: they win and pay their own high bid, we pay 0.
-                # This is pure chip preservation.
                 bid_amt = max(0, int(opp_pred_min) - 1)
+                self.auction_intent = 'lose'
 
             # Record for later chip-delta inference
             self.my_auction_bid          = int(min(bid_amt, current_state.my_chips))
@@ -242,19 +252,15 @@ class Player(BaseBot):
             return ActionBid(self.my_auction_bid)
 
         # =========================================================================
-        # 2. LOGISTIC REGRESSION PREDICTION (Welford-normalised input)
+        # 2. LOGISTIC REGRESSION PREDICTION (log1p-normalised input)
         # =========================================================================
+        # log1p(pot) is robust to the Pareto distribution of poker pot sizes:
+        # a single all-in shove cannot skew a running mean and corrupt future hands.
+        # Dividing by LOG_SCALE (= log1p(5000)) maps pots to roughly [0, 1].
         street = current_state.street
 
-        pot = float(current_state.pot)
-        n   = self.scale_n[street] + 1
-        delta    = pot - self.scale_mean[street]
-        new_mean = self.scale_mean[street] + delta / n
-        self.scale_M2[street]   += delta * (pot - new_mean)
-        self.scale_mean[street]  = new_mean
-        self.scale_n[street]     = n
-        std      = math.sqrt(self.scale_M2[street] / n)
-        x_scaled = (pot - new_mean) / max(std, 1.0)
+        pot      = float(current_state.pot)
+        x_scaled = math.log1p(pot) / self._LOG_SCALE
 
         z     = (self.theta[street] * x_scaled) + self.b[street]
         y_hat = 1.0 / (1.0 + math.exp(-max(-50.0, min(50.0, z))))
