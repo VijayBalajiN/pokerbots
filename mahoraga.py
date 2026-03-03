@@ -10,8 +10,6 @@ from pkbot.runner import parse_args, run_bot
 
 class Player(BaseBot):
     def __init__(self) -> None:
-        self.hands_played = 0
-
         # ── ML Parameters (Intelligent Bayesian Priors) ─────────────────────────
         # Theta/b per street: model maps scaled pot → opponent hand-percentile
         self.theta = {'pre-flop': -1.0, 'flop': -1.0, 'turn': -1.0, 'river': -1.0}
@@ -21,19 +19,9 @@ class Player(BaseBot):
         self.current_hand_history = {}
         self.training_samples = 0  # counts only full 2-card reveals
 
-        # ── Welford Online Normalization (learned input scaling, per street) ─────
-        # REMOVED: Welford running-mean normalization is fragile against the Pareto
-        # distribution of poker pot sizes (rare all-in shoves skew the mean, causing
-        # normal pots to yield negative x_scaled and flip the model's predictions).
-        # REPLACED WITH: linear scaling capped at 8.0 (= 3200-chip pot).
-        # x = min(pot/400, 8.0) maps:
-        #   pot=200  → 0.50 (normal small pot)
-        #   pot=1000 → 2.50 (large bet / overbet)
-        #   pot=3200 → 8.00 (capped; all-in shoves don't explode gradients)
-        # This preserves strong discrimination between normal/large/all-in,
-        # unlike log1p which compresses log(1000)≈log(5000) within ~19%.
+        # ── Pot Scaling: linear up to 3200, soft log tail beyond ──────────────
         self._POT_SCALE = 400.0
-        self._POT_CAP   = 8.0
+        self._POT_CAP   = 8.0   # = 3200 / 400
 
         # ── Adaptive Auction: Opponent Bid Model (Welford) ───────────────────────
         # Tracks the distribution of the opponent's historical bids.
@@ -43,7 +31,6 @@ class Player(BaseBot):
         self.opp_bid_M2   = 2500.0   # variance numerator; std = sqrt(M2 / n)
 
         # Per-hand auction state machine
-        self.my_initial_chips        = STARTING_STACK  # chips at hand start (post-blind)
         self.my_chips_before_auction = STARTING_STACK  # exact snapshot taken when we bid
         self.my_auction_bid          = 0               # what we bid this auction
         self.auction_resolved        = False           # True once we've processed the result
@@ -70,6 +57,13 @@ class Player(BaseBot):
     # ─────────────────────────────────────────────────────────────────────────────
 
     def _get_chen_score(self, cards):
+        """
+        Modified Chen formula with corrections for known misevaluations:
+        - Suited connectors / one-gappers: +1.5 / +0.5 (high playability,
+          board coverage on low/mid textures that pure Chen ignores).
+        - Offsuit dominated broadway (both ≥ T, one ≤ Q, not paired): −1.0
+          (easily dominated by Ax, Kx combos; Chen overvalues these).
+        """
         ranks = {
             'A': 10, 'K': 8, 'Q': 7, 'J': 6, 'T': 5,
             '9': 4.5, '8': 4, '7': 3.5, '6': 3, '5': 2.5,
@@ -80,13 +74,32 @@ class Player(BaseBot):
         score = max(ranks[rank1], ranks[rank2])
         if rank1 == rank2:
             score = max(5, ranks[rank1] * 2)
-        if suit1 == suit2:
+        suited = suit1 == suit2
+        if suited:
             score += 2
         gap = abs(ranks[rank1] - ranks[rank2])
         if   gap == 1: score -= 1
         elif gap == 2: score -= 2
         elif gap == 3: score -= 4
         elif gap >= 4: score -= 5
+
+        # ── Playability corrections ──────────────────────────────────────────
+        # Suited connectors (gap ≤ 1): high implied odds, strong board coverage
+        # on low/mid flops that pure Chen misses entirely.
+        if suited and gap <= 1 and rank1 != rank2:
+            score += 1.5
+        # Suited one-gappers (gap == 2): weaker but still playable
+        elif suited and gap == 2:
+            score += 0.5
+
+        # Offsuit dominated broadway: KTo, QTo, KJo, QJo, JTo — these are
+        # overvalued by Chen because of high card strength, but they play
+        # terribly post-flop (dominated by Ax/Kx combos).
+        if not suited and rank1 != rank2:
+            r1, r2 = ranks[rank1], ranks[rank2]
+            if min(r1, r2) >= 5 and max(r1, r2) <= 8:  # both T..Q range
+                score -= 1.0
+
         return score
 
     def _build_preflop_cache(self):
@@ -112,25 +125,57 @@ class Player(BaseBot):
         """Population std estimate from Welford accumulators."""
         return math.sqrt(M2 / max(n, 1))
 
+    # Discrete bet-sizing buckets: prevents inverse-engineering of equity from
+    # a continuous sizing function.  Each bucket is selected probabilistically
+    # so that no single bet size uniquely identifies our hand strength.
+    _SIZE_SMALL  = 0.33   # probe / thin value
+    _SIZE_MEDIUM = 0.75   # standard value bet
+    _SIZE_LARGE  = 1.50   # polar (nuts or bluff)
+
     def _compute_bet_fraction(self, equity: float, predicted_percentile: float) -> float:
         """
-        Returns a pot fraction for bet/raise sizing that adapts to both hand
-        strength and opponent type.
+        Returns a pot fraction using DISCRETE MIXED SIZING.
 
-        Against loose opponents (high predicted_percentile → they call wide):
-          → bet LARGER to extract max value from their trash-calling range.
-        Against tight opponents (low predicted_percentile → they fold to big bets):
-          → bet SMALLER to keep them in and win a larger pot.
+        Instead of a continuous slider (which leaks equity to tracking opponents),
+        we select from 3 buckets {0.33, 0.75, 1.50} with probabilities that shift
+        based on equity tier and opponent looseness.
 
-        equity_frac: scales from 0.33x (thin value, equity≈0.55) to 1.0x (nut hand).
-        opp_modifier: [0.6, 1.4] based on how loose/tight the opponent is predicted.
-        Final range: [~0.20, 1.5x pot], capped to avoid over-jamming.
+        Against loose opponents: weight shifts toward larger buckets.
+        Against tight opponents: weight shifts toward smaller buckets.
         """
-        # Scale equity 0.55→0.95 linearly onto [0.33, 1.0]
-        equity_frac = max(0.33, min(1.0, (equity - 0.55) / 0.40))
-        # Loose opponent: up to +40% on bet size; tight: down to -40%
-        opp_modifier = 0.6 + predicted_percentile * 0.8   # [0.6, 1.4]
-        return min(1.5, equity_frac * opp_modifier)
+        # ── Determine equity tier ─────────────────────────────────────────────
+        # Opponent looseness shifts probability mass toward larger buckets.
+        # loose_shift in [-0.15, +0.15]: positive = loose opp = bigger bets.
+        loose_shift = (predicted_percentile - 0.5) * 0.30
+
+        if equity >= 0.80:
+            # Strong hand: mostly large, sometimes medium to disguise
+            p_small  = max(0.0, 0.05 - loose_shift)
+            p_medium = max(0.0, 0.35 - loose_shift)
+            # p_large = remainder
+        elif equity >= 0.60:
+            # Medium hand: mostly medium, occasionally small or large
+            p_small  = max(0.0, 0.25 - loose_shift)
+            p_medium = 0.50
+            # p_large = remainder
+        else:
+            # Thin value / marginal: mostly small, occasionally medium
+            p_small  = max(0.0, 0.65 - loose_shift)
+            p_medium = max(0.0, 0.30 + loose_shift * 0.5)
+            # p_large = remainder
+
+        # Ensure probabilities are valid
+        p_small  = max(0.0, min(1.0, p_small))
+        p_medium = max(0.0, min(1.0, p_medium))
+        p_large  = max(0.0, 1.0 - p_small - p_medium)
+
+        r = random.random()
+        if r < p_small:
+            return self._SIZE_SMALL
+        elif r < p_small + p_medium:
+            return self._SIZE_MEDIUM
+        else:
+            return self._SIZE_LARGE
 
     def _update_opp_bid_model(self, bid_estimate):
         """Update the opponent bid distribution with a new (possibly soft) sample."""
@@ -182,9 +227,7 @@ class Player(BaseBot):
     # ─────────────────────────────────────────────────────────────────────────────
 
     def on_hand_start(self, game_info: GameInfo, current_state: PokerState) -> None:
-        self.hands_played += 1
         self.preflop_score   = self._get_chen_score(current_state.my_hand)
-        self.my_initial_chips        = current_state.my_chips  # chips AFTER posting blind
         self.my_chips_before_auction  = current_state.my_chips
         self.my_auction_bid           = 0
         self.auction_resolved         = False
@@ -298,14 +341,21 @@ class Player(BaseBot):
             return ActionBid(self.my_auction_bid)
 
         # =========================================================================
-        # 2. LOGISTIC REGRESSION PREDICTION (linear capped scaling)
+        # 2. LOGISTIC REGRESSION PREDICTION (linear + log tail scaling)
         # =========================================================================
-        # x = min(pot/400, 8.0): linear up to 3200-chip pots, capped after.
-        # Deterministic, outlier-immune, preserves discrimination between pot sizes.
+        # x = pot/400              for pot ≤ 3200 (linear discrimination)
+        # x = 8 + ln(1 + Δ/400)   for pot > 3200 (soft dampened tail)
+        # Prevents cap arbitrage while keeping gradients bounded.
         street = current_state.street
 
         pot      = float(current_state.pot)
-        x_scaled = min(pot / self._POT_SCALE, self._POT_CAP)
+        x_raw    = pot / self._POT_SCALE
+        if x_raw <= self._POT_CAP:
+            x_scaled = x_raw
+        else:
+            # Soft logarithmic tail: preserves differentiation past the cap
+            # pot=3200 → 8.0,  pot=5000 → ~9.70,  pot=10000 → ~11.25
+            x_scaled = self._POT_CAP + math.log1p(x_raw - self._POT_CAP)
 
         z     = (self.theta[street] * x_scaled) + self.b[street]
         y_hat = 1.0 / (1.0 + math.exp(-max(-50.0, min(50.0, z))))
