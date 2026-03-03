@@ -25,10 +25,15 @@ class Player(BaseBot):
         # REMOVED: Welford running-mean normalization is fragile against the Pareto
         # distribution of poker pot sizes (rare all-in shoves skew the mean, causing
         # normal pots to yield negative x_scaled and flip the model's predictions).
-        # REPLACED WITH: log1p normalization — deterministic, outlier-immune, monotonic.
-        # log1p(pot) / LOG_SCALE maps [0, 5000] → [0, ~2.8], preserving gradient signal
-        # with the existing theta/b priors without any running state.
-        self._LOG_SCALE = math.log1p(5000.0)  # ≈ 8.52; normalises pots to ~[0, 1]
+        # REPLACED WITH: linear scaling capped at 8.0 (= 3200-chip pot).
+        # x = min(pot/400, 8.0) maps:
+        #   pot=200  → 0.50 (normal small pot)
+        #   pot=1000 → 2.50 (large bet / overbet)
+        #   pot=3200 → 8.00 (capped; all-in shoves don't explode gradients)
+        # This preserves strong discrimination between normal/large/all-in,
+        # unlike log1p which compresses log(1000)≈log(5000) within ~19%.
+        self._POT_SCALE = 400.0
+        self._POT_CAP   = 8.0
 
         # ── Adaptive Auction: Opponent Bid Model (Welford) ───────────────────────
         # Tracks the distribution of the opponent's historical bids.
@@ -45,6 +50,14 @@ class Player(BaseBot):
         # 'win'  = we actively tried to win (strong hand)
         # 'lose' = we deliberately bid below floor (weak/marginal hand)
         self.auction_intent          = 'lose'
+
+        # ── Opponent Aggression Tracker ───────────────────────────────────────────
+        # Counts post-flop bets/raises by opponent to inform check-raise decisions.
+        self.opp_postflop_bets  = 0
+        self.opp_postflop_hands = 0
+
+        # ── Per-hand state ────────────────────────────────────────────────────────
+        self.is_ip = False  # in position (acting last) this hand
 
         # ── Pre-allocated deck ────────────────────────────────────────────────────
         all_ranks = '23456789TJQKA'
@@ -98,6 +111,26 @@ class Player(BaseBot):
     def _welford_std(self, n, M2):
         """Population std estimate from Welford accumulators."""
         return math.sqrt(M2 / max(n, 1))
+
+    def _compute_bet_fraction(self, equity: float, predicted_percentile: float) -> float:
+        """
+        Returns a pot fraction for bet/raise sizing that adapts to both hand
+        strength and opponent type.
+
+        Against loose opponents (high predicted_percentile → they call wide):
+          → bet LARGER to extract max value from their trash-calling range.
+        Against tight opponents (low predicted_percentile → they fold to big bets):
+          → bet SMALLER to keep them in and win a larger pot.
+
+        equity_frac: scales from 0.33x (thin value, equity≈0.55) to 1.0x (nut hand).
+        opp_modifier: [0.6, 1.4] based on how loose/tight the opponent is predicted.
+        Final range: [~0.20, 1.5x pot], capped to avoid over-jamming.
+        """
+        # Scale equity 0.55→0.95 linearly onto [0.33, 1.0]
+        equity_frac = max(0.33, min(1.0, (equity - 0.55) / 0.40))
+        # Loose opponent: up to +40% on bet size; tight: down to -40%
+        opp_modifier = 0.6 + predicted_percentile * 0.8   # [0.6, 1.4]
+        return min(1.5, equity_frac * opp_modifier)
 
     def _update_opp_bid_model(self, bid_estimate):
         """Update the opponent bid distribution with a new (possibly soft) sample."""
@@ -156,7 +189,13 @@ class Player(BaseBot):
         self.my_auction_bid           = 0
         self.auction_resolved         = False
         self.auction_intent           = 'lose'
+        # In Heads-Up, the Big Blind acts FIRST post-flop (Out of Position).
+        # SB (dealer) acts last post-flop = In Position.
+        self.is_ip                    = not current_state.is_bb
         self.current_hand_history = {}
+        # Per-hand aggression tracking (reset each hand)
+        self.opp_was_aggressive_this_hand = False
+        self.flop_seen_this_hand          = False
 
     def on_hand_end(self, game_info: GameInfo, current_state: PokerState) -> None:
         """Backpropagation engine: updates θ/b for each street we acted on."""
@@ -200,8 +239,10 @@ class Player(BaseBot):
             error    = y_hat - y_true
             grad_sig = y_hat * (1.0 - y_hat)
 
-            self.theta[street] -= self.learning_rate * (error * grad_sig * x_scaled)
-            self.b[street]     -= self.learning_rate * (error * grad_sig)
+            # Decaying learning rate: stabilises after many training samples
+            lr = self.learning_rate / (1.0 + self.training_samples * 0.01)
+            self.theta[street] -= lr * (error * grad_sig * x_scaled)
+            self.b[street]     -= lr * (error * grad_sig)
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Decision Engine
@@ -212,6 +253,11 @@ class Player(BaseBot):
         # ── Resolve auction result on first post-auction street ──────────────────
         if current_state.street in ('flop', 'turn', 'river'):
             self._resolve_auction(current_state)
+
+        # Only count hands that actually reach the post-flop stage
+        if current_state.street == 'flop' and not self.flop_seen_this_hand:
+            self.opp_postflop_hands += 1
+            self.flop_seen_this_hand = True
 
         # =========================================================================
         # 1. ADAPTIVE AUCTION STRATEGY
@@ -252,15 +298,14 @@ class Player(BaseBot):
             return ActionBid(self.my_auction_bid)
 
         # =========================================================================
-        # 2. LOGISTIC REGRESSION PREDICTION (log1p-normalised input)
+        # 2. LOGISTIC REGRESSION PREDICTION (linear capped scaling)
         # =========================================================================
-        # log1p(pot) is robust to the Pareto distribution of poker pot sizes:
-        # a single all-in shove cannot skew a running mean and corrupt future hands.
-        # Dividing by LOG_SCALE (= log1p(5000)) maps pots to roughly [0, 1].
+        # x = min(pot/400, 8.0): linear up to 3200-chip pots, capped after.
+        # Deterministic, outlier-immune, preserves discrimination between pot sizes.
         street = current_state.street
 
         pot      = float(current_state.pot)
-        x_scaled = math.log1p(pot) / self._LOG_SCALE
+        x_scaled = min(pot / self._POT_SCALE, self._POT_CAP)
 
         z     = (self.theta[street] * x_scaled) + self.b[street]
         y_hat = 1.0 / (1.0 + math.exp(-max(-50.0, min(50.0, z))))
@@ -283,13 +328,20 @@ class Player(BaseBot):
             call_threshold    = max(2.0, min(8.0,   5.0 + tightness_adj))
             premium_threshold = max(8.0, min(14.0, 10.0 + tightness_adj))
 
+            # Position adjustment: tighten thresholds OOP, loosen IP
+            pos_adj = -0.5 if self.is_ip else 0.5
+            raise_threshold   += pos_adj
+            call_threshold    += pos_adj
+            premium_threshold += pos_adj
+
             if current_state.cost_to_call > 0:
                 if current_state.cost_to_call <= 20:
                     if self.preflop_score >= raise_threshold and current_state.can_act(ActionRaise):
-                        return ActionRaise(int(max(
-                            current_state.raise_bounds[0],
-                            min(current_state.raise_bounds[1], current_state.raise_bounds[0] + 40)
-                        )))
+                        # Adaptive raise sizing: bigger vs loose, smaller vs tight
+                        pf_frac  = self._compute_bet_fraction(0.70, predicted_percentile)
+                        min_r, max_r = current_state.raise_bounds
+                        target   = max(min_r, min(max_r, min_r + int(current_state.pot * pf_frac)))
+                        return ActionRaise(int(target))
                     elif self.preflop_score >= call_threshold:
                         return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
                 else:
@@ -297,16 +349,18 @@ class Player(BaseBot):
                         if current_state.pot > 400 or self.preflop_score < 14:
                             return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
                         if current_state.can_act(ActionRaise):
-                            return ActionRaise(int(max(
-                                current_state.raise_bounds[0],
-                                min(current_state.raise_bounds[1],
-                                    current_state.raise_bounds[0] + current_state.pot * 0.5)
-                            )))
+                            pf_frac  = self._compute_bet_fraction(0.80, predicted_percentile)
+                            min_r, max_r = current_state.raise_bounds
+                            target   = max(min_r, min(max_r, min_r + int(current_state.pot * pf_frac)))
+                            return ActionRaise(int(target))
                         return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
                 return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
             else:
                 if self.preflop_score >= raise_threshold and current_state.can_act(ActionRaise):
-                    return ActionRaise(int(current_state.raise_bounds[0]))
+                    pf_frac  = self._compute_bet_fraction(0.65, predicted_percentile)
+                    min_r, max_r = current_state.raise_bounds
+                    target   = max(min_r, min(max_r, min_r + int(current_state.pot * pf_frac)))
+                    return ActionRaise(int(target))
                 return ActionCheck() if current_state.can_act(ActionCheck) else ActionCall()
 
         # =========================================================================
@@ -342,18 +396,20 @@ class Player(BaseBot):
         num_to_keep     = max(1, int(len(hand_strengths) * predicted_percentile))
         filtered_range  = [(hand_tuple, 1.0) for hand_tuple, _ in hand_strengths[:num_to_keep]]
 
+        # Scale MC samples with range size: more samples for larger ranges
+        num_mc_equity = min(500, max(100, len(filtered_range)))
         try:
-            equity = eval7.py_hand_vs_range_monte_carlo(my_cards, filtered_range, list(board_cards), 200)
+            equity = eval7.py_hand_vs_range_monte_carlo(my_cards, filtered_range, list(board_cards), num_mc_equity)
         except Exception:
             equity = 0.0
 
         # Threat level: MC vs FULL revealed-card-constrained range (no ML filter)
-        # Gives a scale-invariant measure of how far behind we are with that card known
         threat_level = 0.0
         if revealed and hand_strengths:
             full_range = [(hand_tuple, 1.0) for hand_tuple, _ in hand_strengths]
+            num_mc_threat = min(300, max(50, len(full_range)))
             try:
-                raw_equity   = eval7.py_hand_vs_range_monte_carlo(my_cards, full_range, list(board_cards), 100)
+                raw_equity   = eval7.py_hand_vs_range_monte_carlo(my_cards, full_range, list(board_cards), num_mc_threat)
                 threat_level = max(0.0, 0.5 - raw_equity)
             except Exception:
                 threat_level = 0.0
@@ -363,41 +419,66 @@ class Player(BaseBot):
         # =========================================================================
         # 5. DECISION EXECUTION
         # =========================================================================
-        can_raise_safely = True
+        # Position adjustment for post-flop thresholds: IP can play slightly wider
+        pos_edge = -0.03 if self.is_ip else 0.03
 
-        # Hard cap: don't raise into large pots without a monster
-        if current_state.pot > 800 and hand_type not in ["Flush", "Full House", "Four of a Kind", "Straight Flush"]:
+        can_raise_safely = True
+        safe_hand_types = ["Straight", "Flush", "Full House", "Four of a Kind", "Straight Flush"]
+
+        # Hard cap: don't raise into large pots without a strong made hand
+        if current_state.pot > 800 and hand_type not in safe_hand_types:
             can_raise_safely = False
 
-        # Exploitation override: after 10 quality training hands, relax cap on strong equities
+        # Exploitation override: after 10 quality training hands, relax cap
         if self.training_samples >= 10 and equity > 0.85:
-            if hand_type in ["Straight", "Three of a Kind", "Two Pair"]:
+            if hand_type in ["Three of a Kind", "Two Pair"]:
                 can_raise_safely = True
 
-        if current_state.cost_to_call > 0:
-            # Overbet defence
-            if current_state.cost_to_call > 1000 and hand_type in ["High Card", "Pair"]:
-                return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
+        # ── Opponent aggression rate (for check-raise logic) ─────────────────────
+        opp_aggression = (self.opp_postflop_bets / max(1, self.opp_postflop_hands))
 
-            required_equity = pot_odds + threat_level
+        if current_state.cost_to_call > 0:
+            # Only count one aggressive action per hand to keep the ratio cleanly between 0.0 and 1.0
+            if not self.opp_was_aggressive_this_hand:
+                self.opp_postflop_bets += 1
+                self.opp_was_aggressive_this_hand = True
+
+            # Overbet defence: now factors in equity + predicted range, not just hand type
+            if current_state.cost_to_call > 1000:
+                if equity < 0.35 and hand_type in ["High Card", "Pair"]:
+                    return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
+
+            required_equity = pot_odds + threat_level + pos_edge
             if equity > required_equity:
                 if can_raise_safely and current_state.can_act(ActionRaise) and equity > max(0.65, required_equity + 0.20):
-                    min_r, max_r = current_state.raise_bounds
-                    target_bet   = max(min_r, min(max_r, min_r + int(current_state.pot * 0.75)))
+                    min_r, max_r   = current_state.raise_bounds
+                    bet_frac       = self._compute_bet_fraction(equity, predicted_percentile)
+                    target_bet     = max(min_r, min(max_r, min_r + int(current_state.pot * bet_frac)))
                     return ActionRaise(int(target_bet))
                 return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
             return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
         else:
-            # ML-Driven C-Betting: if the model has learned the opponent plays a wide,
-            # trashy range (high predicted_percentile), lower our betting threshold
-            # so we bluff them off the pot even when we miss the flop.
-            # Against a tight opponent (low percentile) keep the conservative 0.55 bar.
-            bet_threshold = 0.40 if predicted_percentile > 0.60 else 0.55
+            # ── Slow-play / trap: check with the near-nuts 25% of the time ───────
+            # This induces bluffs from aggressive opponents and disguises our range.
+            if equity > 0.92 and hand_type in safe_hand_types and random.random() < 0.25:
+                return ActionCheck() if current_state.can_act(ActionCheck) else ActionCall()
+
+            # ── Check-raise trap: check with strong hands vs aggressive opponents ─
+            # If opponent bets frequently (aggression > 40%), check strong hands
+            # ~30% of the time to set up a check-raise on their next bet.
+            if (opp_aggression > 0.40 and equity > 0.70
+                    and hand_type not in ["High Card"]
+                    and random.random() < 0.30):
+                return ActionCheck() if current_state.can_act(ActionCheck) else ActionCall()
+
+            # ML-Driven C-Betting: lower threshold against loose opponents
+            bet_threshold = (0.40 if predicted_percentile > 0.60 else 0.55) + pos_edge
 
             if equity > (bet_threshold + threat_level):
                 if can_raise_safely and current_state.can_act(ActionRaise):
-                    min_r, max_r = current_state.raise_bounds
-                    target_bet   = max(min_r, min(max_r, min_r + int(current_state.pot * 0.50)))
+                    min_r, max_r   = current_state.raise_bounds
+                    bet_frac       = self._compute_bet_fraction(equity, predicted_percentile)
+                    target_bet     = max(min_r, min(max_r, min_r + int(current_state.pot * bet_frac)))
                     return ActionRaise(int(target_bet))
             return ActionCheck() if current_state.can_act(ActionCheck) else ActionCall()
 
