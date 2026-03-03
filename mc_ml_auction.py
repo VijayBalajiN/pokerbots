@@ -18,8 +18,15 @@ class Player(BaseBot):
         self.learning_rate = 0.01
         
         self.current_hand_history = {}
-        self.training_samples = 0 # Tracks actual learning events (opp revealed cards)
-        
+        self.training_samples = 0 # Counts only full 2-card reveal events
+
+        # 3. Learned Input Scaling (Welford Online Normalization, one set per street)
+        # Priors seeded with reasonable pot-size estimates per street
+        streets = ['pre-flop', 'flop', 'turn', 'river']
+        self.scale_n    = {s: 1    for s in streets}
+        self.scale_mean = {'pre-flop': 50.0, 'flop': 200.0, 'turn': 350.0, 'river': 500.0}
+        self.scale_M2   = {'pre-flop': 2500.0, 'flop': 40000.0, 'turn': 122500.0, 'river': 250000.0}
+
         # 2. Latency Optimization: Pre-allocate deck & combinations
         all_ranks = '23456789TJQKA'
         all_suits = 'cdhs'
@@ -63,9 +70,12 @@ class Player(BaseBot):
         """The Latency-Safe Backpropagation Engine"""
         opp_cards = current_state.opp_revealed_cards
         if not opp_cards:
-            return 
-            
-        self.training_samples += 1 # We actually saw cards and learned!
+            return
+
+        # Only full 2-card reveals count as quality supervised samples
+        full_reveal = len(opp_cards) == 2
+        if full_reveal:
+            self.training_samples += 1
             
         for street, state_data in self.current_hand_history.items():
             if street == 'pre-flop':
@@ -87,9 +97,12 @@ class Player(BaseBot):
                             y_true = idx / len(hand_strengths)
                             break
                 else:
+                    # Single revealed card: average the percentile over all hands containing it
+                    # This gives an unbiased expectation rather than the biased median
                     opp_card_str = opp_cards[0]
-                    indices = [idx for idx, (hand, strength) in enumerate(hand_strengths) if opp_card_str in [c.__str__() for c in hand]]
-                    y_true = (indices[len(indices)//2] / len(hand_strengths)) if indices else 0.5
+                    indices = [idx for idx, (hand, strength) in enumerate(hand_strengths)
+                               if opp_card_str in [c.__str__() for c in hand]]
+                    y_true = (sum(indices) / len(indices) / len(hand_strengths)) if indices else 0.5
                 
             x_scaled = state_data['x_scaled']
             y_hat = state_data['y_hat']
@@ -126,9 +139,17 @@ class Player(BaseBot):
         # ---------------------------------------------------------
         street = current_state.street
         
-        # Prevent MathOverflow: Scale Pot Size down for the ML Logic
-        x_scaled = current_state.pot / 1000.0
-        
+        # Learned Input Scaling: Welford online normalization (mean/std tracked per street)
+        pot = float(current_state.pot)
+        n = self.scale_n[street] + 1
+        delta = pot - self.scale_mean[street]
+        new_mean = self.scale_mean[street] + delta / n
+        self.scale_M2[street] += delta * (pot - new_mean)
+        self.scale_mean[street] = new_mean
+        self.scale_n[street] = n
+        std = math.sqrt(self.scale_M2[street] / n)
+        x_scaled = (pot - new_mean) / max(std, 1.0)
+
         z = (self.theta[street] * x_scaled) + self.b[street]
         y_hat = 1.0 / (1.0 + math.exp(-max(-50, min(50, z)))) # Clamped safety
         predicted_percentile = max(0.02, min(1.0, y_hat))
@@ -140,29 +161,41 @@ class Player(BaseBot):
         }
 
         # ---------------------------------------------------------
-        # 3. PRE-FLOP LOGIC (Tightened Squeeze Defense)
+        # 3. PRE-FLOP LOGIC (Adaptive via Learned Opponent Percentile)
         # ---------------------------------------------------------
         if current_state.street == 'pre-flop':
+            # predicted_percentile: low = opponent plays few hands (tight), high = plays many (loose).
+            # tightness_adj > 0 means tight opponent → raise our requirements.
+            # tightness_adj < 0 means loose opponent → lower requirements.
+            # Multiplier 4.0 → max swing of ±2.0 across the [0.02, 1.0] percentile range.
+            tightness_adj = (0.5 - predicted_percentile) * 4.0
+
+            # Adaptive Chen score thresholds (clamped to sane ranges)
+            raise_threshold   = max(6.0, min(12.0,  9.0 + tightness_adj))  # base 9
+            call_threshold    = max(2.0, min(8.0,   5.0 + tightness_adj))  # base 5
+            premium_threshold = max(8.0, min(14.0, 10.0 + tightness_adj))  # base 10
+
             if current_state.cost_to_call > 0:
-                # Tightened to 20: Only complete small blinds/limps with marginal hands
-                if current_state.cost_to_call <= 20: 
-                    if self.preflop_score >= 9 and current_state.can_act(ActionRaise):
+                if current_state.cost_to_call <= 20:
+                    # Small blind / limp: raise with good hands, call with playable ones
+                    if self.preflop_score >= raise_threshold and current_state.can_act(ActionRaise):
                         return ActionRaise(int(max(current_state.raise_bounds[0], min(current_state.raise_bounds[1], current_state.raise_bounds[0] + 40))))
-                    elif self.preflop_score >= 5:
+                    elif self.preflop_score >= call_threshold:
                         return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
                 else:
-                    # If they raise to > 20 chips, STRICTLY require a premium hand (Score >= 10)
-                    if self.preflop_score >= 10:
+                    # Larger raise: require premium hand, scaled by how tight/loose they are
+                    if self.preflop_score >= premium_threshold:
                         if current_state.pot > 400 or self.preflop_score < 14:
                             return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
                         if current_state.can_act(ActionRaise):
                             return ActionRaise(int(max(current_state.raise_bounds[0], min(current_state.raise_bounds[1], current_state.raise_bounds[0] + current_state.pot * 0.5))))
                         return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
-                        
-                # Completely eliminates the 60-chip and 120-chip bleed from prior logs
+
+                # Below threshold: fold rather than bleed chips
                 return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
             else:
-                if self.preflop_score >= 9 and current_state.can_act(ActionRaise):
+                # No cost to call: open-raise with strong hands, check otherwise
+                if self.preflop_score >= raise_threshold and current_state.can_act(ActionRaise):
                     return ActionRaise(int(current_state.raise_bounds[0]))
                 return ActionCheck() if current_state.can_act(ActionCheck) else ActionCall()
 
@@ -176,7 +209,8 @@ class Player(BaseBot):
         hand_type = eval7.handtype(hand_value)
 
         # C-Engine Safety: Filter dead cards immediately to prevent Zero-Option Segfaults
-        dead_strings = set(current_state.my_hand + current_state.board)
+        revealed = current_state.opp_revealed_cards
+        dead_strings = set(current_state.my_hand + current_state.board + (revealed if revealed else []))
         deck = [self.full_deck[card_str] for card_str in self.full_deck if card_str not in dead_strings]
         
         possible_hands = itertools.combinations(deck, 2)
@@ -185,6 +219,13 @@ class Player(BaseBot):
             hand_strengths.append((hand, eval7.evaluate(list(hand + board_cards))))
             
         hand_strengths.sort(key=lambda item: item[1], reverse=True)
+
+        # If we know one of their cards (auction peek), restrict range to only combos containing it
+        if revealed:
+            rev_card_obj = self.full_deck.get(revealed[0])
+            if rev_card_obj is not None:
+                hand_strengths = [(hand, strength) for hand, strength in hand_strengths
+                                  if rev_card_obj in hand]
         self.current_hand_history[street]['cached_evals'] = hand_strengths
         
         num_to_keep = max(1, int(len(hand_strengths) * predicted_percentile))
@@ -197,20 +238,18 @@ class Player(BaseBot):
         except Exception:
             equity = 0.0 # Exception Suicide Fix
 
-        # Threat Assessment from Auction Peek
+        # Threat Assessment: MC over the full revealed-card-constrained range (no ML filter)
+        # This gives a fair, scale-invariant comparison vs our hand
         threat_level = 0.0
-        if current_state.opp_revealed_cards:
-            rev_card = eval7.Card(current_state.opp_revealed_cards[0])
-            their_known_cards = list(board_cards) + [rev_card]
-            if len(their_known_cards) >= 5:
-                if eval7.evaluate(their_known_cards) > hand_value:
-                    equity = 0.0 
-            
-            board_ranks = [c[0] for c in current_state.board]
-            board_suits = [c[1] for c in current_state.board]
-            if current_state.opp_revealed_cards[0][0] in board_ranks: threat_level += 0.25 
-            elif current_state.opp_revealed_cards[0][0] in ['A', 'K', 'Q']: threat_level += 0.10
-            if board_suits.count(current_state.opp_revealed_cards[0][1]) >= 2: threat_level += 0.10
+        if revealed and hand_strengths:
+            full_reveal_range = [(hand_tuple, 1.0) for hand_tuple, _ in hand_strengths]
+            try:
+                raw_equity = eval7.py_hand_vs_range_monte_carlo(
+                    my_cards, full_reveal_range, list(board_cards), 100)
+                # threat_level rises as raw_equity falls below 0.5 (they're ahead of us)
+                threat_level = max(0.0, 0.5 - raw_equity)
+            except Exception:
+                threat_level = 0.0
 
         pot_odds = current_state.cost_to_call / max(1, current_state.pot + current_state.cost_to_call)
 
