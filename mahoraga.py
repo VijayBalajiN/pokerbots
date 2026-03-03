@@ -24,11 +24,12 @@ class Player(BaseBot):
         self._POT_CAP   = 8.0   # = 3200 / 400
 
         # ── Adaptive Auction: Opponent Bid Model (Welford) ───────────────────────
-        # Tracks the distribution of the opponent's historical bids.
-        # Seeded with a neutral prior (mean=50, std=50) before any data.
+        # Seeded with a prior anchored near the typical competitive bid range (~200).
+        # Starting at 50 caused ~100-round convergence lag; 200 converges in ~5 rounds.
+        # std=50 is kept so opp_pred_max=250 → premium bids start at 251 (correct).
         self.opp_bid_n    = 1
-        self.opp_bid_mean = 50.0
-        self.opp_bid_M2   = 2500.0   # variance numerator; std = sqrt(M2 / n)
+        self.opp_bid_mean = 200.0
+        self.opp_bid_M2   = 2500.0   # variance numerator; std = sqrt(M2 / n) = 50
 
         # Per-hand auction state machine
         self.my_chips_before_auction = STARTING_STACK  # exact snapshot taken when we bid
@@ -205,20 +206,11 @@ class Player(BaseBot):
             # Exact observation: opponent bid exactly chip_delta
             self._update_opp_bid_model(chip_delta)
         else:
-            # We lost. How we estimate their bid depends on whether we *tried* to win.
-            # If auction_intent == 'win': our bid was genuine → they beat it, so they
-            #   bid somewhere above ours. Anchor on our bid + upward nudge.
-            # If auction_intent == 'lose': our bid was deliberately near-zero and tells
-            #   us nothing about their actual bid. Anchoring on it would cause a
-            #   self-reinforcing downward spiral. Instead anchor on the current model
-            #   mean, which is already our best estimate of their typical bid.
+            # We lost: MC bid > our_bid. Anchor soft estimate just above our bid.
+            # Multiplier 0.5 (was 0.2): converges ~2x faster toward MC's actual bid
+            # while still underestimating slightly (we want to bid mean-1, not overshoot).
             opp_bid_std = self._welford_std(self.opp_bid_n, self.opp_bid_M2)
-            if self.auction_intent == 'win':
-                # Genuine contest: they outbid us, so they're somewhere above our bid
-                soft_estimate = self.my_auction_bid + max(5.0, opp_bid_std * 0.5)
-            else:
-                # Intentional fold: use model mean as anchor (not our useless 0-bid)
-                soft_estimate = self.opp_bid_mean + max(5.0, opp_bid_std * 0.25)
+            soft_estimate = self.my_auction_bid + max(5.0, opp_bid_std * 0.5)
             soft_estimate = min(soft_estimate, 500.0)  # cap at reasonable maximum
             self._update_opp_bid_model(soft_estimate)
 
@@ -313,27 +305,24 @@ class Player(BaseBot):
             opp_pred_max = self.opp_bid_mean + opp_bid_std
 
             if self.preflop_score >= 10:
-                # ── WANT TO WIN: barely outbid predicted max ─────────────────────
+                # ── WANT TO WIN: outbid predicted max comfortably ─────────────────
                 target = opp_pred_max + 1 + random.randint(0, 5)
                 bid_amt = int(min(target, current_state.my_chips))
                 self.auction_intent = 'win'
 
-            elif self.preflop_score >= 6:
-                # ── MARGINAL HAND: decide based on information value ──────────────
-                if opp_pred_max < 30 and random.random() < 0.40:
-                    # Cheap contest: barely outbid their expected floor
-                    target = opp_pred_min + 1 + random.randint(0, 3)
-                    bid_amt = int(min(target, current_state.my_chips))
-                    self.auction_intent = 'win'
-                else:
-                    # Bow out: bid below their floor so they win but pay their own high bid
-                    bid_amt = max(0, int(opp_pred_min) - 1)
-                    self.auction_intent = 'lose'
-
             else:
-                # ── DON'T WANT TO WIN: bid below predicted floor ─────────────────
-                bid_amt = max(0, int(opp_pred_min) - 1)
-                self.auction_intent = 'lose'
+                # ── ALL OTHER HANDS: bid just below expected opponent bid ─────────
+                # Bidding opp_bid_mean - 1 achieves two goals:
+                # (a) When MC bids LOW (weak hand, ~15): WE WIN the auction cheaply
+                #     and see MC's card even with a marginal/weak hand.
+                # (b) When MC bids HIGH (strong hand, ~248): MC still wins but pays
+                #     ~247 chips into the pot (vs old strategy of 17-35 chips).
+                # This is strictly better than bidding near 0.
+                target = max(1, int(self.opp_bid_mean) - 1)
+                bid_amt = int(min(target, current_state.my_chips))
+                # Use 'win' intent so that when we lose, the soft estimate is anchored
+                # just above our bid (accurate: MC beat us by at least 1 chip).
+                self.auction_intent = 'win'
 
             # Record for later chip-delta inference
             self.my_auction_bid          = int(min(bid_amt, current_state.my_chips))
@@ -378,8 +367,9 @@ class Player(BaseBot):
             call_threshold    = max(2.0, min(8.0,   5.0 + tightness_adj))
             premium_threshold = max(8.0, min(14.0, 10.0 + tightness_adj))
 
-            # Position adjustment: tighten thresholds OOP, loosen IP
-            pos_adj = -0.5 if self.is_ip else 0.5
+            # Position adjustment (pre-flop): IP = SB, acts first pre-flop = tighter.
+            # OOP = BB, acts last pre-flop = slightly looser (position info advantage).
+            pos_adj = 0.5 if self.is_ip else -0.5
             raise_threshold   += pos_adj
             call_threshold    += pos_adj
             premium_threshold += pos_adj
@@ -422,9 +412,14 @@ class Player(BaseBot):
         hand_value = eval7.evaluate(my_cards + list(board_cards))
         hand_type  = eval7.handtype(hand_value)
 
-        # Build opponent range: exclude dead cards (our hand + board + revealed card)
+        # Build opponent range: exclude cards that CANNOT be in opponent's hand.
+        # Dead = our hole cards + board cards.
+        # The revealed card IS in the opponent's hand, so it must stay in the deck
+        # so that hand_strengths can include combos containing it.
+        # (Bug: including revealed in dead_strings made the filtered range empty,
+        #  causing equity to default to 1.0 → catastrophic all-in losses.)
         revealed    = current_state.opp_revealed_cards
-        dead_strings = set(current_state.my_hand + current_state.board + (revealed if revealed else []))
+        dead_strings = set(current_state.my_hand + current_state.board)
         deck         = [self.full_deck[cs] for cs in self.full_deck if cs not in dead_strings]
 
         hand_strengths = []
@@ -493,14 +488,52 @@ class Player(BaseBot):
                 self.opp_postflop_bets += 1
                 self.opp_was_aggressive_this_hand = True
 
-            # Overbet defence: now factors in equity + predicted range, not just hand type
-            if current_state.cost_to_call > 1000:
+            # ── Graduated overbet defence ────────────────────────────────────────
+            # Fold weak hands at lower thresholds to avoid bleeding chips.
+            # High Card: fold when facing > 400 chips without strong equity
+            # Pair: fold when facing > 600 chips without strong equity
+            # Original 1000-chip threshold kept as final safety net.
+            ctc = current_state.cost_to_call
+            if ctc > 400 and hand_type == "High Card" and equity < 0.45:
+                return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
+            if ctc > 600 and hand_type == "Pair" and equity < 0.45:
+                return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
+            if ctc > 1000:
                 if equity < 0.35 and hand_type in ["High Card", "Pair"]:
                     return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
 
+            # ── Iron-clad protection: never fold strong made hands ──────────────
+            # A made straight/flush/boat should ALWAYS at least call, period.
+            # The ML-filtered equity can be pessimistically low when the model
+            # predicts a tight range (e.g., 8-high flush shows equity <0.40
+            # vs predicted top-20% range → fold → catastrophic -1100 chip loss).
+            # Remove equity gate for calling; only gate the raise decision.
+            if hand_type in safe_hand_types:
+                if can_raise_safely and current_state.can_act(ActionRaise) and equity > 0.65:
+                    min_r, max_r   = current_state.raise_bounds
+                    bet_frac       = self._compute_bet_fraction(equity, predicted_percentile)
+                    target_bet     = max(min_r, min(max_r, min_r + int(current_state.pot * bet_frac)))
+                    return ActionRaise(int(target_bet))
+                return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
+
+            # Three of a Kind: strong hand, protect from folding when ML predicts
+            # a tight range. Call when equity > 0.30 (covers most realistic boards).
+            if hand_type == "Three of a Kind" and equity > 0.30:
+                return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
+
             required_equity = pot_odds + threat_level + pos_edge
             if equity > required_equity:
-                if can_raise_safely and current_state.can_act(ActionRaise) and equity > max(0.65, required_equity + 0.20):
+                # ── ANTI-ESCALATION: only re-raise with premium hands ────────
+                # When facing a bet, re-raising with top pair / two pair / draws
+                # then folding to the 4-bet is the #1 chip leak (-1000 to -3500
+                # per hand). Only re-raise with genuine nutted hands.
+                can_reraise = False
+                if can_raise_safely and current_state.can_act(ActionRaise):
+                    if hand_type in safe_hand_types and equity > 0.65:
+                        can_reraise = True
+                    elif hand_type == "Three of a Kind" and equity > 0.80:
+                        can_reraise = True
+                if can_reraise:
                     min_r, max_r   = current_state.raise_bounds
                     bet_frac       = self._compute_bet_fraction(equity, predicted_percentile)
                     target_bet     = max(min_r, min(max_r, min_r + int(current_state.pot * bet_frac)))
@@ -508,9 +541,11 @@ class Player(BaseBot):
                 return ActionCall() if current_state.can_act(ActionCall) else ActionFold()
             return ActionFold() if current_state.can_act(ActionFold) else ActionCheck()
         else:
-            # ── Slow-play / trap: check with the near-nuts 25% of the time ───────
-            # This induces bluffs from aggressive opponents and disguises our range.
-            if equity > 0.92 and hand_type in safe_hand_types and random.random() < 0.25:
+            # ── Slow-play / trap: check with the near-nuts vs aggressive opponents ─
+            # Only slow-play if opponent actually bets when checked to (aggression > 0.40).
+            # Against passive opponents, slow-playing just gives free cards.
+            if (equity > 0.92 and hand_type in safe_hand_types
+                    and opp_aggression > 0.40 and random.random() < 0.25):
                 return ActionCheck() if current_state.can_act(ActionCheck) else ActionCall()
 
             # ── Check-raise trap: check with strong hands vs aggressive opponents ─
